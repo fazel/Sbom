@@ -24,15 +24,16 @@ type UpdateInfo struct {
 	LatestVersion    string
 	UpdateNeeded     bool
 	SecurityPatch    bool
+	IsArchived       bool // NEW: To track if the repository is archived (deprecated)
 	ReleaseNotesList []string
 	Status           string
 }
 
 type NpmPackageJSON struct {
-	Name         string            `json:"name"`
-	Version      string            `json:"version"`
-	Dependencies map[string]string `json:"dependencies"`
-	//DevDependencies map[string]string `json:"devDependencies"`
+	Name            string            `json:"name"`
+	Version         string            `json:"version"`
+	Dependencies    map[string]string `json:"dependencies"`
+	DevDependencies map[string]string `json:"devDependencies"`
 }
 
 type NpmInfo struct {
@@ -49,6 +50,7 @@ func createGitHubClient() *github.Client {
 	ctx := context.Background()
 	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" {
+		// Fallback for unauthenticated client
 		return github.NewClient(nil)
 	}
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
@@ -56,17 +58,12 @@ func createGitHubClient() *github.Client {
 	return github.NewClient(tc)
 }
 
-// parsePackageJSON: حالا فایل را می‌خواند
 func parsePackageJSON(filename string) (NpmPackageJSON, error) {
 	var pkgJSON NpmPackageJSON
-
-	// 1. خواندن کل محتوای فایل
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return pkgJSON, fmt.Errorf("error reading %s: %w", filename, err)
 	}
-
-	// 2. Unmarshal کردن
 	err = json.Unmarshal(data, &pkgJSON)
 	if err != nil {
 		return pkgJSON, fmt.Errorf("error unmarshalling package.json: %w", err)
@@ -75,6 +72,7 @@ func parsePackageJSON(filename string) (NpmPackageJSON, error) {
 }
 
 func parseGitHubRepoURL(url string) (owner, repo string) {
+	// Aggressive cleaning logic (Unchanged)
 	url = strings.TrimPrefix(url, "git://")
 	url = strings.TrimPrefix(url, "git+https://")
 	url = strings.TrimPrefix(url, "https://")
@@ -127,7 +125,7 @@ func fetchNpmInfo(pkgName string) (*NpmInfo, error) {
 	return &info, nil
 }
 
-// --- Changelog Extraction Helpers ---
+// --- Changelog & Error Extraction Helpers (Unchanged) ---
 
 func getOwnerRepoFromChangelog(notes string) (owner, repo string) {
 	if ownerIndex := strings.Index(notes, "(Owner: "); ownerIndex != -1 {
@@ -185,7 +183,7 @@ func extractBodyFromChangelog(notes string) string {
 	return body
 }
 
-// --- Core Check Logic ---
+// --- Core Check Logic (Updated to include Archival Check) ---
 
 func checkNpmUpdate(client *github.Client, pkgName, currentVer string) UpdateInfo {
 	cleanVer := strings.TrimFunc(currentVer, func(r rune) bool {
@@ -214,80 +212,100 @@ func checkNpmUpdate(client *github.Client, pkgName, currentVer string) UpdateInf
 	info.LatestVersion = latestVer
 
 	if semver.Compare(info.CurrentVersion, info.LatestVersion) >= 0 {
-		info.Status = "✅ Up to date"
-		return info
+		info.UpdateNeeded = false // Explicitly set to false if up-to-date
+	} else {
+		info.UpdateNeeded = true
 	}
-
-	info.UpdateNeeded = true
 
 	repoURL := npmInfo.Repository.URL
 	owner, repo := parseGitHubRepoURL(repoURL)
 
-	if owner != "" && repo != "" {
+	if owner == "" || repo == "" {
+		info.Status = "🔄 Update Recommended (Repo link missing)"
+		return info
+	}
 
-		release, resp, tagErr := client.Repositories.GetLatestRelease(context.Background(), owner, repo)
+	// --- 1. CHECK ARCHIVED (DEPRECATED) STATUS ---
+	repoDetails, _, repoErr := client.Repositories.Get(context.Background(), owner, repo)
+	if repoErr != nil {
+		fmt.Printf(" [ERROR] Could not fetch repo details for %s/%s: %v\n", owner, repo, repoErr)
+	} else if repoDetails.GetArchived() {
+		info.IsArchived = true
+		info.Status = "⛔️ DEPRECATED (Archived)"
+		fmt.Printf(" [DEPRECATED] Repository %s/%s is ARCHIVED.\n", owner, repo)
+	}
+
+	// If archived, no further version checks are strictly necessary, but we continue
+	// to populate version info if UpdateNeeded is true.
+	if info.IsArchived && !info.UpdateNeeded {
+		return info // If archived AND up-to-date, stop here.
+	}
+
+	// --- 2. VERSION & SECURITY CHECK (Only if UpdateNeeded) ---
+	if info.UpdateNeeded {
+
+		releases, resp, listErr := client.Repositories.ListReleases(context.Background(), owner, repo, &github.ListOptions{
+			PerPage: 30,
+		})
 
 		if resp != nil && resp.StatusCode == http.StatusForbidden && strings.Contains(resp.Header.Get("X-RateLimit-Remaining"), "0") {
-
 			resetTimeString := resp.Header.Get("X-RateLimit-Reset")
-			resetTimeInt, err := strconv.ParseInt(resetTimeString, 10, 64)
+			resetTimeInt, _ := strconv.ParseInt(resetTimeString, 10, 64)
+			info.ReleaseNotesList = append(info.ReleaseNotesList, fmt.Sprintf("❌ GitHub Rate Limit Exceeded. Try again after %s. (Repo: %s/%s)", time.Unix(resetTimeInt, 0).Format(time.RFC1123), owner, repo))
 
-			if err == nil {
-				resetTime := time.Unix(resetTimeInt, 0)
-				info.ReleaseNotesList = append(info.ReleaseNotesList, fmt.Sprintf("❌ GitHub Rate Limit Exceeded. Try again after %s. (Repo: %s/%s)", resetTime.Format(time.RFC1123), owner, repo))
-			} else {
-				info.ReleaseNotesList = append(info.ReleaseNotesList, fmt.Sprintf("❌ GitHub Rate Limit Exceeded. (Error parsing time: %v) (Repo: %s/%s)", err, owner, repo))
-			}
+		} else if listErr != nil {
+			info.ReleaseNotesList = append(info.ReleaseNotesList, fmt.Sprintf("Warning: Could not list releases from GitHub (%s/%s). Error: %v", owner, repo, listErr))
 
-		} else if release != nil && tagErr == nil {
+		} else {
+			foundLatestReleaseChangelog := false
 
-			githubTag := release.GetTagName()
+			for _, release := range releases {
+				tag := release.GetTagName()
 
-			cleanTagParts := strings.Split(githubTag, "@")
-			if len(cleanTagParts) > 1 {
-				githubTag = cleanTagParts[len(cleanTagParts)-1]
-			}
-			if !strings.HasPrefix(githubTag, "v") {
-				githubTag = "v" + githubTag
-			}
+				cleanTagParts := strings.Split(tag, "@")
+				if len(cleanTagParts) > 1 {
+					tag = cleanTagParts[len(cleanTagParts)-1]
+				}
+				if !strings.HasPrefix(tag, "v") {
+					tag = "v" + tag
+				}
 
-			if semver.Compare(info.CurrentVersion, githubTag) < 0 {
+				if semver.Compare(tag, info.CurrentVersion) <= 0 {
+					break
+				}
 
+				// Security Check (Checks all intermediate versions)
 				body := strings.ToLower(release.GetBody() + " " + release.GetName())
 				if strings.Contains(body, "security") || strings.Contains(body, "vulnerability") || strings.Contains(body, "cve") || strings.Contains(body, "patch") {
 					info.SecurityPatch = true
 				}
 
-				releaseDetail := fmt.Sprintf("\n--- Latest Changelog for %s (Tag: %s) (Owner: %s) (Repo: %s) ---\n%s\n", release.GetName(), release.GetTagName(), owner, repo, release.GetBody())
-				info.ReleaseNotesList = append(info.ReleaseNotesList, releaseDetail)
-			}
-
-		} else if tagErr != nil && strings.Contains(tagErr.Error(), "404 Not Found") {
-
-			tags, _, tagListErr := client.Repositories.ListTags(context.Background(), owner, repo, &github.ListOptions{PerPage: 10})
-
-			if tagListErr == nil && len(tags) > 0 {
-				for _, tag := range tags {
-					if strings.HasSuffix(tag.GetName(), info.LatestVersion[1:]) || tag.GetName() == info.LatestVersion {
-						info.ReleaseNotesList = append(info.ReleaseNotesList, fmt.Sprintf("Warning: Found Tag '%s'. Changelog unavailable (Repo: %s/%s)", tag.GetName(), owner, repo))
-						break
-					}
+				// Store Changelog for the very latest version only
+				if !foundLatestReleaseChangelog {
+					releaseDetail := fmt.Sprintf("\n--- Latest Changelog for %s (Tag: %s) (Owner: %s) (Repo: %s) ---\n%s\n", release.GetName(), release.GetTagName(), owner, repo, release.GetBody())
+					info.ReleaseNotesList = append(info.ReleaseNotesList, releaseDetail)
+					foundLatestReleaseChangelog = true
 				}
 			}
 
-			if len(info.ReleaseNotesList) == 0 {
-				info.ReleaseNotesList = append(info.ReleaseNotesList, fmt.Sprintf("Warning: Could not fetch release or tag details from GitHub (%s/%s). Error: %v", owner, repo, tagErr))
+			if !foundLatestReleaseChangelog {
+				info.ReleaseNotesList = append(info.ReleaseNotesList, fmt.Sprintf("Warning: Could not fetch specific release details for version %s, or only tags exist. (Repo: %s/%s)", info.LatestVersion, owner, repo))
 			}
-
-		} else if tagErr != nil {
-			info.ReleaseNotesList = append(info.ReleaseNotesList, fmt.Sprintf("Warning: Could not fetch latest release details from GitHub (%s/%s). Error: %v", owner, repo, tagErr))
 		}
-	} else {
-		info.ReleaseNotesList = append(info.ReleaseNotesList, fmt.Sprintf("Warning: Could not extract GitHub repo from NPM URL: %s", repoURL))
+
 	}
 
-	if info.SecurityPatch {
+	// 3. Final Status Assignment
+	if info.IsArchived {
+		if info.UpdateNeeded {
+			info.Status = "⛔️ DEPRECATED (Update Needed)"
+		} else {
+			info.Status = "⛔️ DEPRECATED (Up to date)"
+		}
+	} else if info.SecurityPatch {
 		info.Status = "🚨 URGENT Update Required (Security Patch!)"
+	} else if !info.UpdateNeeded {
+		info.Status = "✅ Up to date"
 	} else if len(info.ReleaseNotesList) == 0 || strings.HasPrefix(info.ReleaseNotesList[0], "Warning:") || strings.HasPrefix(info.ReleaseNotesList[0], "❌") {
 		info.Status = "🔄 Update Recommended (Changelog unavailable)"
 	} else {
@@ -297,7 +315,7 @@ func checkNpmUpdate(client *github.Client, pkgName, currentVer string) UpdateInf
 	return info
 }
 
-// --- Final Output Function (Table Only, New Header) ---
+// --- Output Function (Markdown Table) ---
 
 func writeOutput(pkgJSON NpmPackageJSON, infos []UpdateInfo, filename string) error {
 	if !strings.HasSuffix(filename, ".md") {
@@ -314,40 +332,30 @@ func writeOutput(pkgJSON NpmPackageJSON, infos []UpdateInfo, filename string) er
 	defer writer.Flush()
 
 	// 1. Project Info Header
-	_, _ = writer.WriteString(fmt.Sprintf("# 📈 گزارش وضعیت به‌روزرسانی وابستگی‌های فرانت‌اند\n\n"))
-	_, _ = writer.WriteString(fmt.Sprintf("## پروژه‌ی **%s** (`%s`)\n", pkgJSON.Name, pkgJSON.Version))
-	_, _ = writer.WriteString("این گزارش خلاصه‌ای از وضعیت به‌روزرسانی وابستگی‌های اصلی (`dependencies`) شما را نمایش می‌دهد.\n")
-	_, _ = writer.WriteString("> **توجه:** 'نیاز به آپدیت' به معنای توصیه شدن آپدیت است، مگر آنکه پچ امنیتی ذکر شود.\n\n")
+	_, _ = writer.WriteString(fmt.Sprintf("# 📈 Frontend Dependency Update Report\n\n"))
+	_, _ = writer.WriteString(fmt.Sprintf("## Project: **%s** (`%s`)\n", pkgJSON.Name, pkgJSON.Version))
+	_, _ = writer.WriteString("This report summarizes the update status for your main dependencies (`dependencies`).\n")
+	_, _ = writer.WriteString("> **Note:** 'Update Recommended' means updating is advised, unless a security patch is explicitly noted.\n\n")
 	_, _ = writer.WriteString("---\n\n")
 
-	_, _ = writer.WriteString("## خلاصه وضعیت به‌روزرسانی\n\n")
+	_, _ = writer.WriteString("## Summary of Update Status\n\n")
 
-	// Markdown Table Header (اضافه شدن ستون ایندکس)
-	_, _ = writer.WriteString("| # | 📦 پکیج | 🟢 وضعیت | 🏷️ نسخه فعلی | ⬆️ آخرین نسخه NPM | 📝 چنج‌لاگ (خلاصه) |\n")
-	_, _ = writer.WriteString("| :---: | :--- | :---: | :---: | :--- | :--- |\n")
+	// Markdown Table Header
+	_, _ = writer.WriteString("| # | 📦 Package | 🟢 Status | 🏷️ Current Version | ⬆️ Latest Version | 📝 Changelog Summary |\n")
+	_, _ = writer.WriteString("| :---: | :--- | :---: | :---: | :---: | :--- |\n")
 
 	index := 1
 	for _, info := range infos {
-		// 1. تعیین نمایش وضعیت
+		// 1. Determine Status Display
 		statusDisplay := info.Status
-		if info.SecurityPatch {
-			statusDisplay = "**🚨 پچ امنیتی!**"
-		} else if info.UpdateNeeded && strings.Contains(info.Status, "Changelog unavailable") {
-			statusDisplay = "🔄 نیاز به آپدیت (نامشخص)"
-		} else if info.UpdateNeeded {
-			statusDisplay = "🔄 نیاز به آپدیت"
-		} else {
-			statusDisplay = "✅ به‌روز است"
-		}
 
-		// 2. استخراج لینک و چنج‌لاگ
+		// 2. Extract Link and Changelog Summary
 		repoLinkURL := ""
 		changelogSummary := "N/A"
 
 		if len(info.ReleaseNotesList) > 0 {
 			notes := info.ReleaseNotesList[0]
 
-			// الف) خطا/عدم دسترسی یا فقط تگ پیدا شده است
 			if strings.HasPrefix(notes, "❌") || strings.HasPrefix(notes, "Warning:") {
 				if owner, repo := getOwnerRepoFromError(notes); owner != "" {
 					repoLinkURL = fmt.Sprintf("https://github.com/%s/%s/tags", owner, repo)
@@ -355,10 +363,9 @@ func writeOutput(pkgJSON NpmPackageJSON, infos []UpdateInfo, filename string) er
 					changelogSummary = strings.TrimPrefix(changelogSummary, "Warning: ")
 					changelogSummary = strings.TrimPrefix(changelogSummary, "❌ ")
 				} else {
-					changelogSummary = "❌ خطا: دسترسی به GitHub"
+					changelogSummary = "❌ Error: GitHub access"
 				}
 			} else {
-				// ب) استخراج اطلاعات از چنج‌لاگ موفق
 				owner, repo := getOwnerRepoFromChangelog(notes)
 				tagStart := strings.Index(notes, "(Tag:") + 6
 				tagEnd := strings.Index(notes, ")")
@@ -375,7 +382,6 @@ func writeOutput(pkgJSON NpmPackageJSON, infos []UpdateInfo, filename string) er
 					}
 				}
 
-				// خلاصه کردن چنج‌لاگ (۸۰ کاراکتر اول)
 				changelogBody := extractBodyFromChangelog(notes)
 				if len(changelogBody) > 80 {
 					changelogSummary = strings.TrimSpace(changelogBody[:80]) + "..."
@@ -385,14 +391,13 @@ func writeOutput(pkgJSON NpmPackageJSON, infos []UpdateInfo, filename string) er
 			}
 		}
 
-		// 3. ساخت فرمت Markdown لینک برای آخرین نسخه (NPM)
+		// 3. Create Markdown link for Latest Version
 		latestVersionDisplay := info.LatestVersion
 		if repoLinkURL != "" {
-			// لینک به صورت: [v7.3.5](URL)
 			latestVersionDisplay = fmt.Sprintf("[`%s`](%s)", info.LatestVersion, repoLinkURL)
 		}
 
-		// 4. نوشتن ردیف جدول
+		// 4. Write table row
 		line := fmt.Sprintf("| %d | `%s` | %s | `%s` | %s | %s |\n",
 			index, info.Repo, statusDisplay, info.CurrentVersion, latestVersionDisplay, changelogSummary)
 		_, _ = writer.WriteString(line)
@@ -408,7 +413,7 @@ func main() {
 
 	client := createGitHubClient()
 
-	// 1. خواندن از فایل
+	// 1. Read from file
 	pkgJSON, err := parsePackageJSON(packageFileName)
 	if err != nil {
 		fmt.Printf("Fatal Error: Could not read or parse %s. %v\n", packageFileName, err)
@@ -417,19 +422,17 @@ func main() {
 
 	var results []UpdateInfo
 
-	// فیلتر کردن وابستگی‌های محلی (مثل file:libs/...)
-	// فقط dependencies اصلی را بررسی می‌کنیم
+	// 2. Process only 'dependencies'
 	packagesToCheck := pkgJSON.Dependencies
 
 	filteredPackages := make(map[string]string)
 	for pkgName, ver := range packagesToCheck {
-		// ignore local file paths and complex git urls
 		if !strings.HasPrefix(ver, "file:") && !strings.Contains(ver, "git") {
 			filteredPackages[pkgName] = ver
 		}
 	}
 
-	fmt.Printf("شروع بررسی %d پکیج (پروژه: %s@%s)...\n", len(filteredPackages), pkgJSON.Name, pkgJSON.Version)
+	fmt.Printf("Starting check for %d packages (Project: %s@%s)...\n", len(filteredPackages), pkgJSON.Name, pkgJSON.Version)
 
 	for pkgName, currentVer := range filteredPackages {
 
@@ -444,5 +447,5 @@ func main() {
 		return
 	}
 
-	fmt.Printf("✅ عملیات با موفقیت انجام شد. نتایج در فایل **%s** ذخیره گردید.\n", outputFile)
+	fmt.Printf("✅ Operation completed successfully. Results saved in **%s**.\n", outputFile)
 }
